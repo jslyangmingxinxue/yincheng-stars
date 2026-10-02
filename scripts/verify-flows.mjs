@@ -1,0 +1,28 @@
+import assert from 'node:assert/strict';
+import {readFile,writeFile,mkdir} from 'node:fs/promises';
+const origin='http://127.0.0.1:5173';
+const roles={admin:'__sites_local_auth=1',parent:'__sites_local_auth=1; yc_preview_role=parent',other:'__sites_local_auth=1; yc_preview_role=other-parent',visitor:''};
+async function get(role='visitor'){const r=await fetch(origin+'/api/classroom',{headers:{cookie:roles[role]}});assert.equal(r.status,200);return r.json()}
+async function post(payload,role='admin',expected=200){const r=await fetch(origin+'/api/classroom',{method:'POST',headers:{cookie:roles[role],origin,'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();assert.equal(r.status,expected,JSON.stringify(d));return d;}
+const notes=[];function pass(s){notes.push(s);console.log('PASS '+s)}
+let saved;try{
+ let d=await get();assert.equal(d.students.length,0);assert.ok(d.posts.every(p=>p.public));pass('公开访客无学生资料与内部作品');
+ d=await get('admin');if(d.example)await post({action:'seed'});saved=await post({action:'backup'});
+ await post({action:'save',kind:'work',title:'越权测试',children:['s2'],visibility:'private',term:'2026-autumn'},'parent',403);await post({action:'save',kind:'notice',title:'越权公告'},'parent',403);await post({action:'settings',value:{}},'parent',403);pass('家长不能关联其他孩子、发布公告或修改网站设置');
+ const secret=await post({action:'save',kind:'work',title:'验证专属资料',body:'只属于星小川',children:['s2'],visibility:'private',term:'2026-autumn'});
+ const bytes=await readFile(new URL('../public/campus.png',import.meta.url));const form=new FormData();form.set('post',secret.id);form.set('file',new File([bytes],'验证图片.png',{type:'image/png'}));let uploaded=await fetch(origin+'/api/upload',{method:'POST',headers:{cookie:roles.admin,origin},body:form});assert.equal(uploaded.status,200);const file=await uploaded.json();
+ await post({action:'save',id:secret.id,revision:secret.revision,kind:'work',title:'验证专属资料',body:'只属于星小川',children:['s2'],visibility:'private',term:'2026-autumn',submit:true});
+ d=await get('parent');assert.ok(!d.posts.some(p=>p.id===secret.id));assert.equal((await fetch(origin+'/api/files/'+file.id,{headers:{cookie:roles.parent}})).status,403);assert.equal((await fetch(origin+'/api/files/'+file.id)).status,403);assert.equal((await fetch(origin+'/api/files/'+file.id,{headers:{cookie:roles.other}})).status,200);pass('私密作品与原始文件仅对应家长和老师可读');
+ let own=await post({action:'save',kind:'work',title:'验证家长投稿',body:'一次真实的持久化验证',children:['s1'],visibility:'shared',term:'2026-autumn'},'parent');
+ own=await post({action:'save',id:own.id,revision:own.revision,kind:'work',title:'验证家长投稿',body:'一次真实的持久化验证',children:['s1'],visibility:'shared',term:'2026-autumn',submit:true},'parent');assert.equal(own.status,'pending');d=await get('other');assert.ok(!d.posts.some(p=>p.id===own.id));pass('家长投稿进入待审核，不提前展示给其他家长');
+ await post({action:'review',id:own.id,approve:false,reason:'请补充说明'});d=await get('parent');assert.equal(d.posts.find(p=>p.id===own.id).rejection,'请补充说明');
+ own=await post({action:'save',id:own.id,revision:own.revision,kind:'work',title:'验证家长投稿',body:'补充后的说明',children:['s1'],visibility:'shared',term:'2026-autumn',submit:true},'parent');await post({action:'review',id:own.id,approve:true});d=await get('other');assert.ok(d.posts.some(p=>p.id===own.id));assert.ok(!(await get()).posts.some(p=>p.id===own.id));pass('退回、重新提交与审核发布，全班共享不等于公开');
+ await post({action:'comment',post:own.id,body:'给老师的专属留言',private:true},'parent');d=await get('other');assert.ok(!d.comments.some(c=>c.body==='给老师的专属留言'));pass('私密留言不会泄露给其他家长');
+ const revision=await get('parent');const published=revision.posts.find(p=>p.id===own.id);const changed=await post({action:'save',id:published.id,revision:published.revision,kind:'work',title:'验证修改稿',body:'审核前不替换旧版本',children:['s1'],visibility:'shared',term:'2026-autumn',submit:true},'parent');assert.notEqual(changed.id,own.id);d=await get('other');assert.ok(d.posts.some(p=>p.id===own.id));assert.ok(!d.posts.some(p=>p.id===changed.id));await post({action:'review',id:changed.id,approve:true});d=await get('other');assert.ok(!d.posts.some(p=>p.id===own.id));assert.ok(d.posts.some(p=>p.id===changed.id));pass('已发布作品修改采用重新审核的新版本');
+ await post({action:'students',rows:[{number:'99',name:'测试甲'},{number:'99',name:'测试乙'}]},'admin',400);await post({action:'students',rows:[{number:'99',name:'验证学生'}],term:'2026-autumn'});d=await get('admin');assert.ok(d.students.some(s=>s.number==='99'));pass('名单重复检查与持久导入');
+ await post({action:'delete',id:changed.id});d=await get('other');assert.ok(!d.posts.some(p=>p.id===changed.id));await post({action:'restore',id:changed.id});d=await get('admin');assert.equal(d.posts.find(p=>p.id===changed.id).status,'draft');pass('删除隔离与回收站恢复');
+ await post({action:'termArchive',id:'2026-autumn',archived:true});await post({action:'save',kind:'work',title:'归档阻止投稿',body:'测试',children:['s1'],visibility:'shared',term:'2026-autumn',submit:true},'parent',400);pass('历史学期停止家长投稿');
+ const noOrigin=await fetch(origin+'/api/classroom',{method:'POST',headers:{cookie:roles.admin,'Content-Type':'application/json'},body:'{"action":"backup"}'});assert.equal(noOrigin.status,403);await post({action:'backup'},'visitor',401);pass('跨站请求与未登录写入被拒绝');
+ await post({action:'restoreBackup',key:saved.key});saved=null;d=await get('admin');assert.ok(!d.students.some(s=>s.number==='99'));assert.ok(!d.posts.some(p=>p.title.startsWith('验证')));pass('备份恢复成功，验证数据已清理');
+ await mkdir('outputs',{recursive:true});await writeFile('outputs/verification.json',JSON.stringify({time:new Date().toISOString(),passed:notes},null,2));
+}finally{if(saved)await post({action:'restoreBackup',key:saved.key});}
